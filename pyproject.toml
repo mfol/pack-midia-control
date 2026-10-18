@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pack-midia-control"
+version = "0.1.0"
+description = "Local Windows media-key helper for Wallpaper Engine"
+readme = "README.md"
+requires-python = ">=3.10"
+
+[project.scripts]
+pack-midia-control = "pack_midia_control:main"
+
+[tool.setuptools]
+py-modules = ["pack_midia_control"]
+
+[tool.setuptools.package-dir]
+"" = "src"
