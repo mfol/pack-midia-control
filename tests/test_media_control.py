@@ -135,13 +135,17 @@ class MediaControlTests(unittest.TestCase):
                 return {"ok": True, "cost": 3}
         class TestHandler(media_control.MediaHandler):
             usage = FakeCache()
+            limits_reader = staticmethod(lambda: {"claude": None, "codex": {"fiveHour": {"used": 5}}})
         server = ThreadingHTTPServer(("127.0.0.1", 0), TestHandler)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         try:
             base = f"http://127.0.0.1:{server.server_port}"
             with urlopen(Request(base + "/usage", headers={"Origin": "null"}), timeout=3) as response:
-                self.assertEqual(json.loads(response.read().decode("utf-8"))["cost"], 3)
+                body = json.loads(response.read().decode("utf-8"))
+                self.assertEqual(body["cost"], 3)
+                self.assertEqual(body["limits"]["codex"]["fiveHour"]["used"], 5)
+                self.assertIn("now", body)
             with self.assertRaises(HTTPError) as err:
                 urlopen(Request(base + "/usage", headers={"Origin": "https://example.com"}), timeout=3)
             self.assertEqual(err.exception.code, 403)
@@ -150,6 +154,63 @@ class MediaControlTests(unittest.TestCase):
             server.shutdown()
             server.server_close()
             thread.join(timeout=3)
+
+    @unittest.skipIf(media_control is None, "source module not created yet")
+    def test_codex_limits_come_from_latest_token_count_record(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            day = Path(tmp) / "2026" / "11" / "11"
+            day.mkdir(parents=True)
+            old = {"timestamp": "t1", "payload": {"type": "token_count", "rate_limits": {
+                "primary": {"used_percent": 1.0, "window_minutes": 300, "resets_at": 10},
+                "secondary": {"used_percent": 2.0, "window_minutes": 10080, "resets_at": 20}}}}
+            new = {"timestamp": "t2", "payload": {"type": "token_count", "rate_limits": {
+                "primary": {"used_percent": 17.0, "window_minutes": 300, "resets_at": 111},
+                "secondary": {"used_percent": 18.0, "window_minutes": 10080, "resets_at": 222}}}}
+            (day / "rollout-a.jsonl").write_text(
+                json.dumps(old) + "\n{not json\n" + json.dumps({"payload": {"type": "other"}}) + "\n" + json.dumps(new) + "\n",
+                encoding="utf-8")
+            limits = media_control.read_codex_limits(Path(tmp))
+            self.assertEqual(limits["fiveHour"], {"used": 17.0, "resetsAt": 111, "minutes": 300})
+            self.assertEqual(limits["weekly"]["used"], 18.0)
+            self.assertEqual(limits["recordedAt"], "t2")
+            self.assertIsNone(media_control.read_codex_limits(Path(tmp) / "missing"))
+
+    @unittest.skipIf(media_control is None, "source module not created yet")
+    def test_claude_limits_come_from_statusline_file(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "claude-limits.json"
+            self.assertIsNone(media_control.read_claude_limits(path))
+            path.write_text(json.dumps({"saved_at": 1000, "five_hour": {"used_percentage": 7, "resets_at": 99},
+                                        "seven_day": {"used_percentage": 63, "resets_at": 199}}), encoding="utf-8")
+            limits = media_control.read_claude_limits(path)
+            self.assertEqual(limits["fiveHour"], {"used": 7.0, "resetsAt": 99, "minutes": 300})
+            self.assertEqual(limits["weekly"]["used"], 63.0)
+
+    def test_statusline_extracts_only_limits_and_renders_text(self):
+        statusline = load_statusline()
+        payload = {"model": {"display_name": "Opus"}, "cwd": "C:/secret",
+                   "rate_limits": {"five_hour": {"used_percentage": 7.2, "resets_at": 5},
+                                   "seven_day": {"used_percentage": 63, "resets_at": 9}}}
+        limits = statusline.extract_limits(payload, now=42)
+        self.assertEqual(set(limits), {"saved_at", "five_hour", "seven_day"})
+        self.assertEqual(statusline.render(payload, limits), "Opus | 5h 7% · 7d 63%")
+        self.assertIsNone(statusline.extract_limits({"model": {}}))
+        self.assertEqual(statusline.render({}, None), "Claude")
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "sub" / "limits.json"
+            statusline.save_limits(limits, target)
+            self.assertEqual(json.loads(target.read_text(encoding="utf-8"))["five_hour"]["used_percentage"], 7.2)
+
+
+def load_statusline():
+    path = ROOT / "src" / "claude_statusline.py"
+    spec = importlib.util.spec_from_file_location("claude_statusline", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 if __name__ == "__main__":

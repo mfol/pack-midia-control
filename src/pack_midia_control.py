@@ -12,8 +12,9 @@ import time
 from ctypes import wintypes
 from datetime import date, datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 PORT = 47613
 INPUT_KEYBOARD = 1
 KEYEVENTF_KEYUP = 0x0002
@@ -167,6 +168,83 @@ class UsageCache:
 USAGE = UsageCache()
 
 
+# --- Plan limits (5h session / weekly) -------------------------------------
+# Codex writes its last-known rate limits into every session log. Claude Code
+# gives them to the status line, and claude_statusline.py saves them to a file.
+# Both are local files: no credentials are read and no network call is made.
+CODEX_TAIL_BYTES = 512 * 1024
+CODEX_FILES_TO_TRY = 6
+
+
+def _window(used, resets_at, minutes=None) -> dict | None:
+    if not isinstance(used, (int, float)):
+        return None
+    return {
+        "used": round(float(used), 1),
+        "resetsAt": resets_at if isinstance(resets_at, (int, float)) else None,
+        "minutes": minutes,
+    }
+
+
+def read_codex_limits(sessions_dir: Path | None = None) -> dict | None:
+    """Return the newest rate-limit snapshot found in the Codex session logs."""
+    root = sessions_dir or Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex") / "sessions"
+    try:
+        files = sorted(root.rglob("rollout-*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
+    except OSError:
+        return None
+    for path in files[:CODEX_FILES_TO_TRY]:
+        try:
+            with open(path, "rb") as handle:
+                handle.seek(0, os.SEEK_END)
+                size = handle.tell()
+                handle.seek(max(0, size - CODEX_TAIL_BYTES))
+                tail = handle.read().decode("utf-8", errors="ignore")
+        except OSError:
+            continue
+        for line in reversed(tail.splitlines()):
+            if '"rate_limits"' not in line:
+                continue
+            try:
+                record = json.loads(line)
+            except ValueError:
+                continue
+            limits = (record.get("payload") or {}).get("rate_limits")
+            if not isinstance(limits, dict):
+                continue
+            primary, secondary = limits.get("primary") or {}, limits.get("secondary") or {}
+            five = _window(primary.get("used_percent"), primary.get("resets_at"), primary.get("window_minutes"))
+            week = _window(secondary.get("used_percent"), secondary.get("resets_at"), secondary.get("window_minutes"))
+            if five or week:
+                return {"fiveHour": five, "weekly": week, "recordedAt": record.get("timestamp")}
+    return None
+
+
+def read_claude_limits(path: Path | None = None) -> dict | None:
+    """Return the rate limits saved by claude_statusline.py, if any."""
+    if path is None:
+        base = os.environ.get("LOCALAPPDATA") or str(Path.home())
+        path = Path(base) / "pack-midia-control" / "claude-limits.json"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    five = _window((data.get("five_hour") or {}).get("used_percentage"), (data.get("five_hour") or {}).get("resets_at"), 300)
+    week = _window((data.get("seven_day") or {}).get("used_percentage"), (data.get("seven_day") or {}).get("resets_at"), 10080)
+    if not (five or week):
+        return None
+    saved = data.get("saved_at")
+    return {
+        "fiveHour": five,
+        "weekly": week,
+        "recordedAt": datetime.fromtimestamp(saved, timezone.utc).isoformat() if isinstance(saved, (int, float)) else None,
+    }
+
+
+def read_plan_limits() -> dict:
+    return {"claude": read_claude_limits(), "codex": read_codex_limits()}
+
+
 class KEYBDINPUT(ctypes.Structure):
     _fields_ = [
         ("wVk", wintypes.WORD),
@@ -244,6 +322,7 @@ class MediaHandler(BaseHTTPRequestHandler):
     server_version = f"PackMidiaControl/{__version__}"
     command_sender = None
     usage = USAGE
+    limits_reader = staticmethod(read_plan_limits)
 
     def log_message(self, _format, *_args):
         # Do not log media titles or user activity.
@@ -283,8 +362,15 @@ class MediaHandler(BaseHTTPRequestHandler):
             return
         route = self.path.split("?", 1)[0]
         if route == "/usage":
-            snapshot = self.usage.snapshot()
+            snapshot = dict(self.usage.snapshot())
+            try:
+                snapshot["limits"] = self.limits_reader()
+            except Exception:
+                snapshot["limits"] = {"claude": None, "codex": None}
+            snapshot["now"] = int(time.time())
             ok = snapshot.get("ok") or snapshot.get("pending")
+            if snapshot.get("limits") and any(snapshot["limits"].values()):
+                ok = True
             self._json(200 if ok else 502, snapshot, origin)
             return
         if route != "/health":
