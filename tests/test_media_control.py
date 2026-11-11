@@ -75,6 +75,82 @@ class MediaControlTests(unittest.TestCase):
             server.server_close()
             thread.join(timeout=3)
 
+    @unittest.skipIf(media_control is None, "source module not created yet")
+    def test_summarize_usage_picks_current_month_agents_and_active_block(self):
+        from datetime import date
+        monthly = {"monthly": [
+            {"period": "2026-10", "totalCost": 9, "totalTokens": 1},
+            {"period": "2026-11", "totalCost": 12.345, "totalTokens": 500, "inputTokens": 100, "outputTokens": 50,
+             "agents": [
+                 {"agent": "codex", "totalCost": 2, "totalTokens": 100, "modelsUsed": ["gpt"]},
+                 {"agent": "claude", "totalCost": 10.345, "totalTokens": 400, "modelsUsed": ["opus"]},
+             ]},
+        ]}
+        blocks = {"blocks": [
+            {"isActive": False, "costUSD": 1},
+            {"isActive": True, "costUSD": 0.5, "totalTokens": 70, "endTime": "x",
+             "projection": {"remainingMinutes": 30}, "burnRate": {"costPerHour": 3.456}},
+        ]}
+        out = media_control.summarize_usage(monthly, blocks, date(2026, 11, 11))
+        self.assertEqual(out["period"], "2026-11")
+        self.assertEqual(out["cost"], 12.35)
+        self.assertEqual([a["agent"] for a in out["agents"]], ["claude", "codex"])
+        self.assertEqual(out["block"]["remainingMinutes"], 30)
+        self.assertEqual(out["block"]["costPerHour"], 3.46)
+        empty = media_control.summarize_usage({"monthly": []}, None, date(2026, 11, 11))
+        self.assertEqual((empty["cost"], empty["agents"], empty["block"]), (0, [], None))
+
+    @unittest.skipIf(media_control is None, "source module not created yet")
+    def test_usage_cache_refreshes_in_background_and_reuses_result(self):
+        calls = []
+        def loader():
+            calls.append(1)
+            return {"cost": 1.0}
+        now = [0.0]
+        cache = media_control.UsageCache(loader=loader, ttl=60, clock=lambda: now[0])
+        self.assertEqual(cache.snapshot(), {"ok": False, "pending": True})
+        cache.thread.join(timeout=3)
+        first = cache.snapshot()
+        self.assertTrue(first["ok"])
+        self.assertEqual(first["cost"], 1.0)
+        self.assertEqual(len(calls), 1)
+        now[0] = 61
+        cache.snapshot()
+        cache.thread.join(timeout=3)
+        self.assertEqual(len(calls), 2)
+
+    @unittest.skipIf(media_control is None, "source module not created yet")
+    def test_usage_cache_reports_error_when_nothing_loaded(self):
+        def loader():
+            raise RuntimeError("boom")
+        cache = media_control.UsageCache(loader=loader)
+        cache.snapshot()
+        cache.thread.join(timeout=3)
+        self.assertEqual(cache.snapshot()["error"], "boom")
+
+    @unittest.skipIf(media_control is None, "source module not created yet")
+    def test_usage_endpoint_requires_allowed_origin(self):
+        class FakeCache:
+            def snapshot(self):
+                return {"ok": True, "cost": 3}
+        class TestHandler(media_control.MediaHandler):
+            usage = FakeCache()
+        server = ThreadingHTTPServer(("127.0.0.1", 0), TestHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            base = f"http://127.0.0.1:{server.server_port}"
+            with urlopen(Request(base + "/usage", headers={"Origin": "null"}), timeout=3) as response:
+                self.assertEqual(json.loads(response.read().decode("utf-8"))["cost"], 3)
+            with self.assertRaises(HTTPError) as err:
+                urlopen(Request(base + "/usage", headers={"Origin": "https://example.com"}), timeout=3)
+            self.assertEqual(err.exception.code, 403)
+            err.exception.close()
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=3)
+
 
 if __name__ == "__main__":
     unittest.main()

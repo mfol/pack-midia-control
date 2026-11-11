@@ -5,10 +5,15 @@ import argparse
 import ctypes
 import json
 import os
+import shutil
+import subprocess
+import threading
+import time
 from ctypes import wintypes
+from datetime import date, datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 PORT = 47613
 INPUT_KEYBOARD = 1
 KEYEVENTF_KEYUP = 0x0002
@@ -29,6 +34,137 @@ ALLOWED_ORIGINS = {
     "http://localhost:8765",
     "http://localhost:8766",
 }
+
+
+# --- AI usage (Claude Code, Codex, ...) via ccusage -----------------------
+# ccusage reads the local session logs of the coding agents. The version is
+# pinned to a major so a new major cannot change what is executed unnoticed.
+CCUSAGE_PACKAGE = "ccusage@20"
+USAGE_CACHE_SECONDS = 120
+USAGE_TIMEOUT_SECONDS = 180
+
+
+def _run_ccusage(args, runner=None, timeout=USAGE_TIMEOUT_SECONDS):
+    """Run ccusage through npx and return its parsed JSON output."""
+    npx = shutil.which("npx")
+    if npx is None:
+        raise RuntimeError("npx not found; install Node.js")
+    command = [npx, "-y", CCUSAGE_PACKAGE, *args, "--json"]
+    runner = runner or subprocess.run
+    kwargs = {
+        "capture_output": True,
+        "text": True,
+        "encoding": "utf-8",
+        "timeout": timeout,
+        "env": {**os.environ, "NO_COLOR": "1"},
+    }
+    if os.name == "nt":
+        kwargs["creationflags"] = 0x08000000  # CREATE_NO_WINDOW
+    result = runner(command, **kwargs)
+    if result.returncode != 0:
+        raise RuntimeError((result.stderr or "ccusage failed").strip()[-200:])
+    return json.loads(result.stdout)
+
+
+def summarize_usage(monthly: dict, blocks: dict | None, today: date | None = None) -> dict:
+    """Reduce ccusage output to what the wallpaper card needs."""
+    today = today or date.today()
+    period = today.strftime("%Y-%m")
+    rows = monthly.get("monthly") or []
+    row = next((r for r in rows if r.get("period") == period), None) or {}
+    agents = []
+    for item in row.get("agents") or []:
+        agents.append({
+            "agent": item.get("agent"),
+            "cost": round(float(item.get("totalCost") or 0), 2),
+            "tokens": int(item.get("totalTokens") or 0),
+            "input": int(item.get("inputTokens") or 0),
+            "output": int(item.get("outputTokens") or 0),
+            "models": item.get("modelsUsed") or [],
+        })
+    agents.sort(key=lambda a: a["cost"], reverse=True)
+    block = None
+    for candidate in (blocks or {}).get("blocks") or []:
+        if candidate.get("isActive"):
+            projection = candidate.get("projection") or {}
+            burn = candidate.get("burnRate") or {}
+            block = {
+                "cost": round(float(candidate.get("costUSD") or 0), 2),
+                "tokens": int(candidate.get("totalTokens") or 0),
+                "end": candidate.get("endTime"),
+                "remainingMinutes": projection.get("remainingMinutes"),
+                "costPerHour": round(float(burn.get("costPerHour") or 0), 2),
+            }
+            break
+    return {
+        "period": period,
+        "day": today.day,
+        "cost": round(float(row.get("totalCost") or 0), 2),
+        "tokens": int(row.get("totalTokens") or 0),
+        "input": int(row.get("inputTokens") or 0),
+        "output": int(row.get("outputTokens") or 0),
+        "agents": agents,
+        "block": block,
+    }
+
+
+class UsageCache:
+    """Refreshes usage in a background thread so HTTP requests never wait on npx."""
+
+    def __init__(self, loader=None, ttl: float = USAGE_CACHE_SECONDS, clock=time.monotonic):
+        self.loader = loader or self._load
+        self.ttl = ttl
+        self.clock = clock
+        self.lock = threading.Lock()
+        self.data = None
+        self.error = None
+        self.updated = None
+        self.updated_at = None
+        self.refreshing = False
+        self.thread = None
+
+    @staticmethod
+    def _load() -> dict:
+        today = date.today()
+        since = today.replace(day=1).strftime("%Y%m%d")
+        monthly = _run_ccusage(["monthly", "--by-agent", "--since", since])
+        try:
+            blocks = _run_ccusage(["blocks", "--active"])
+        except Exception:
+            blocks = None
+        return summarize_usage(monthly, blocks, today)
+
+    def _refresh(self) -> None:
+        try:
+            data = self.loader()
+            with self.lock:
+                self.data, self.error = data, None
+                self.updated = datetime.now(timezone.utc).isoformat()
+        except Exception as exc:
+            with self.lock:
+                self.error = str(exc)
+        finally:
+            with self.lock:
+                self.refreshing = False
+                self.updated_at = self.clock()
+
+    def snapshot(self) -> dict:
+        """Return cached data and start a refresh when it is stale."""
+        with self.lock:
+            stale = self.updated_at is None or self.clock() - self.updated_at >= self.ttl
+            if stale and not self.refreshing:
+                self.refreshing = True
+                self.thread = threading.Thread(target=self._refresh, daemon=True)
+                self.thread.start()
+            if self.data is None:
+                if self.error and not self.refreshing:
+                    return {"ok": False, "error": self.error}
+                return {"ok": False, "pending": True}
+            return {"ok": True, "updated": self.updated, "refreshing": self.refreshing,
+                    "stale": bool(self.error), **self.data}
+
+
+USAGE = UsageCache()
 
 
 class KEYBDINPUT(ctypes.Structure):
@@ -107,6 +243,7 @@ def origin_allowed(origin: str | None) -> bool:
 class MediaHandler(BaseHTTPRequestHandler):
     server_version = f"PackMidiaControl/{__version__}"
     command_sender = None
+    usage = USAGE
 
     def log_message(self, _format, *_args):
         # Do not log media titles or user activity.
@@ -144,10 +281,16 @@ class MediaHandler(BaseHTTPRequestHandler):
         if not origin_allowed(origin):
             self.send_error(403)
             return
-        if self.path.split("?", 1)[0] != "/health":
+        route = self.path.split("?", 1)[0]
+        if route == "/usage":
+            snapshot = self.usage.snapshot()
+            ok = snapshot.get("ok") or snapshot.get("pending")
+            self._json(200 if ok else 502, snapshot, origin)
+            return
+        if route != "/health":
             self._json(404, {"ok": False, "error": "not found"}, origin)
             return
-        self._json(200, {"ok": True, "commands": list(MEDIA_KEYS)}, origin)
+        self._json(200, {"ok": True, "commands": list(MEDIA_KEYS), "usage": True}, origin)
 
     def do_POST(self):
         origin = self.headers.get("Origin")

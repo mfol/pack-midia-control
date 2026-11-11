@@ -20,6 +20,15 @@ O serviço escuta somente em `127.0.0.1:47613`. Mantenha-o rodando enquanto usar
 
 Por padrão, são aceitos apenas os comandos `previous`, `play-pause` e `next`, enviados pelo wallpaper com origem local. O auxiliar não seleciona um aplicativo específico: o Windows encaminha as teclas ao player que controla a sessão de mídia global ativa.
 
+## Uso de IA (rota `/usage`)
+
+`GET /usage` devolve o consumo do mês corrente de Claude Code, Codex e outros agentes (custo estimado, tokens por agente e o bloco ativo de 5 h), para o card "USO DE IA" do wallpaper.
+
+- Requer Node.js: o auxiliar executa `npx -y ccusage@20`, que lê os logs locais dos agentes (`~/.claude`, `~/.codex`, ...). Na primeira execução o npm baixa o pacote; a versão é fixada na major 20.
+- A coleta roda em segundo plano e fica em cache por 2 minutos; enquanto a primeira coleta não termina, a resposta é `{"ok": false, "pending": true}`.
+- Os valores são **estimativas** de custo a partir de tokens, não a cobrança oficial nem o percentual do plano.
+- Nada é enviado pelo auxiliar; a rota respeita a mesma lista de origens e o mesmo bind em loopback.
+
 ## Verificações
 
 ```powershell
