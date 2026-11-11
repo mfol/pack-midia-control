@@ -58,3 +58,7 @@ Os testes injetam um emissor simulado; não pausam nem avançam a mídia do usu�
 ## Versionamento
 
 O projeto usa SemVer. A versão inicial do pacote é `0.1.0`; releases futuras podem usar tags `vX.Y.Z`. Mensagens de commit seguem Conventional Commits (por exemplo, `feat: ...`, `fix: ...`, `docs: ...`).
+
+## Licença
+
+[MIT](LICENSE): use, modifique e distribua à vontade, sem garantia.

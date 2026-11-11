@@ -4,8 +4,10 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pack-midia-control"
-version = "0.1.0"
-description = "Local Windows media-key helper for Wallpaper Engine"
+version = "0.3.0"
+description = "Local loopback helper for the Neon Noir wallpaper: Windows media keys and Claude Code / Codex usage"
+license = "MIT"
+license-files = ["LICENSE"]
 readme = "README.md"
 requires-python = ">=3.10"
 
@@ -13,7 +15,7 @@ requires-python = ">=3.10"
 pack-midia-control = "pack_midia_control:main"
 
 [tool.setuptools]
-py-modules = ["pack_midia_control"]
+py-modules = ["pack_midia_control", "claude_statusline"]
 
 [tool.setuptools.package-dir]
 "" = "src"
